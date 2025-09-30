@@ -13,11 +13,21 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dropzone
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Compute a lowercase image name (GHCR is picky about case)
+      - name: Image name
+        id: img
+        run: |
+          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner_lc}/dropzone" >> "$GITHUB_OUTPUT"
+
+      # (optional) export to env so later steps can use ${{ env.IMAGE_NAME }} too
+      - name: Export IMAGE_NAME
+        run: echo "IMAGE_NAME=${{ steps.img.outputs.name }}" >> $GITHUB_ENV
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -36,7 +46,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ steps.img.outputs.name }}   # <-- use lowercased value
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
@@ -47,7 +57,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64   # add linux/arm64 if you want multi-arch
+          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
