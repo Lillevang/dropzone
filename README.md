@@ -1,3 +1,5 @@
+![Build & Push](https://github.com/Lillevang/dropzone/actions/workflows/publish.yml/badge.svg)
+
 # Dropzone
 
 A tiny, single-file FastAPI app that lets you **drag-and-drop files in a browser** and streams them to disk.  
@@ -9,10 +11,6 @@ Designed for quick transfers from constrained environments (e.g., Citrix) to you
 - **Container-friendly:** minimal image, non-root by default
 
 ---
-
-![Build & Push](https://github.com/Lillevang/dropzone/actions/workflows/publish.yml/badge.svg)
-
-
 
 ## Quick start (local)
 
