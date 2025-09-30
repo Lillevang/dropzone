@@ -1,13 +1,6 @@
-import hashlib
-import os
-import secrets
-
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pathlib import Path
-from starlette.concurrency import run_in_threadpool
-from typing import List, Optional
+from fastapi.responses import HTMLResponse
 
 
 # ========= app =========
@@ -27,6 +20,7 @@ INDEX_HTML = """
   <title>Dropzone is OFF</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"/>
+  <meta name="robots" content="noindex,nofollow"/>
   <style>
     :root { color-scheme: light dark; }
     * { box-sizing: border-box; }
