@@ -6,59 +6,49 @@ on:
     tags: [ "v*.*.*" ]  # e.g. v0.1.0
   workflow_dispatch: {}
 
-permissions:
-  contents: read
-  packages: write    # allow pushing to GHCR
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-and-push-image:
     runs-on: ubuntu-latest
 
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      # Compute a lowercase image name (GHCR is picky about case)
-      - name: Image name
-        id: img
-        run: |
-          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          echo "name=ghcr.io/${owner_lc}/dropzone" >> "$GITHUB_OUTPUT"
-
-      # (optional) export to env so later steps can use ${{ env.IMAGE_NAME }} too
-      - name: Export IMAGE_NAME
-        run: echo "IMAGE_NAME=${{ steps.img.outputs.name }}" >> $GITHUB_ENV
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - name: Log in to the Container registry
+        uses: docker/login-action
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata (tags, labels)
+      - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action
         with:
-          images: ${{ steps.img.outputs.name }}   # <-- use lowercased value
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
-            type=sha
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action
         with:
           context: .
           push: true
-          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
