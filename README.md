@@ -10,6 +10,10 @@ Designed for quick transfers from constrained environments (e.g., Citrix) to you
 
 ---
 
+![Build & Push](https://github.com/Lillevang/dropzone/actions/workflows/publish.yml/badge.svg)
+
+
+
 ## Quick start (local)
 
 ```bash
