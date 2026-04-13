@@ -1,10 +1,11 @@
 import hashlib
+import hmac
 import os
 import secrets
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pathlib import Path
 from starlette.concurrency import run_in_threadpool
 from typing import List, Optional
@@ -16,8 +17,9 @@ DEST_DIR.mkdir(parents=True, exist_ok=True)
 # TOKEN REQUIRED
 TOKEN = os.getenv("DROPZONE_TOKEN")
 
-# Default 10 GiB
+# Default 10 GiB per file; 0 = unlimited total
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(10*1024 * 1024 * 1024)))
+MAX_TOTAL_BYTES = int(os.getenv("MAX_TOTAL_BYTES", "0"))
 ALLOW_OVERWRITE = os.getenv("ALLOW_OVERWRITE", "false").lower() == "true"
 SAFE_EXTS = set(
     (os.getenv("SAFE_EXTS", ".zip,.tar.gz,.tgz,.7z,.rar,.txt,.csv,.pdf").split(",")))
@@ -41,6 +43,10 @@ def resolve_collision(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def dir_usage(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.iterdir() if f.is_file())
 
 
 def sha256_file(path: Path) -> str:
@@ -196,18 +202,42 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/files")
+def list_files(x_token: Optional[str] = Header(default=None)):
+    if not TOKEN or not hmac.compare_digest(x_token or "", TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    files = sorted(
+        f for f in DEST_DIR.iterdir() if f.is_file() and not f.name.startswith(".part-")
+    )
+    return {"files": [{"name": f.name, "bytes": f.stat().st_size, "bytes_human": human_bytes(f.stat().st_size)} for f in files]}
+
+
+@app.get("/files/{filename}")
+def download_file(filename: str, x_token: Optional[str] = Header(default=None)):
+    if not TOKEN or not hmac.compare_digest(x_token or "", TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Resolve and confirm the path stays inside DEST_DIR
+    path = (DEST_DIR / sanitize_filename(filename)).resolve()
+    if not path.is_relative_to(DEST_DIR) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
 @app.post("/upload")
 async def upload(
     request: Request,
     files: List[UploadFile] = File(...),
     x_token: Optional[str] = Header(default=None)
 ):
-    # Enforce token from header
-    if not TOKEN or x_token != TOKEN:
+    # Enforce token from header (compare_digest prevents timing attacks)
+    if not TOKEN or not hmac.compare_digest(x_token or "", TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     results = []
     for up in files:
+        if MAX_TOTAL_BYTES and dir_usage(DEST_DIR) >= MAX_TOTAL_BYTES:
+            raise HTTPException(status_code=507, detail="Storage limit reached")
+
         safe_name = sanitize_filename(up.filename)
 
         # Enforce extension allowlist (optional)

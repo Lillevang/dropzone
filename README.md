@@ -24,11 +24,18 @@ uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 Open http://localhost:8080, paste the token, click **Save** and drop files.
 
-CLI Sanity check:
+CLI examples:
 
 ```bash
+# Upload
 echo "hello" > test.txt
-curl -H "X-Token": "$DROPZONE_TOKEN" -F "files=@test.txt" http://localhost:8080/upload
+curl -H "X-Token: $DROPZONE_TOKEN" -F "files=@test.txt" http://localhost:8080/upload
+
+# List files
+curl -H "X-Token: $DROPZONE_TOKEN" http://localhost:8080/files
+
+# Download a file (with progress)
+curl -H "X-Token: $DROPZONE_TOKEN" http://localhost:8080/files/archive.zip --progress-bar -o archive.zip
 ```
 
 Health:
@@ -64,6 +71,43 @@ docker run --rm -p 8080:8080 \
 - chown the host folder: `sudo chown -R 10001:10001 ./uploads`, or
 - run the container as your uid: `--user $(id -u):$(id -g)`, or
 - add :Z on SELinux systems.
+
+---
+
+## Podman
+
+Podman is a drop-in replacement for Docker and runs rootless by default, which pairs naturally with the non-root container setup.
+
+Build & run:
+
+```bash
+podman build -t dropzone:local .
+mkdir -p uploads
+
+TOKEN=<your-token>
+
+podman run --rm -p 8080:8080 \
+  -e DROPZONE_TOKEN="$TOKEN" \
+  -e DEST_DIR="/data/uploads" \
+  -v "$PWD/uploads:/data/uploads:Z" \
+  --name dropzone \
+  dropzone:local
+```
+
+The `:Z` label on the volume is needed on SELinux systems (Fedora/RHEL) — Podman will relabel the directory. On non-SELinux systems you can omit it.
+
+Because Podman is rootless, the container's UID 10001 maps to your own UID on the host, so the bind-mounted `uploads/` directory is owned by you with no extra `chown` needed.
+
+Pull and run from GHCR:
+
+```bash
+podman pull ghcr.io/lillevang/dropzone:latest
+
+podman run --rm -p 8080:8080 \
+  -e DROPZONE_TOKEN='<your-token>' \
+  -v "$PWD/uploads:/data/uploads:Z" \
+  ghcr.io/lillevang/dropzone:latest
+```
 
 ---
 
@@ -126,6 +170,7 @@ docker run --rm -p 8080:8080 \
 | `DROPZONE_TOKEN`  | **(required)**                              | Shared secret; must match `X-Token` header from browser/curl              |
 | `DEST_DIR`        | `./uploads`                                 | Destination directory (bind/mount your NAS here)                          |
 | `MAX_BYTES`       | `10737418240` (10 GiB)                      | Per-file size cap                                                         |
+| `MAX_TOTAL_BYTES` | `0` (unlimited)                             | Total bytes allowed in `DEST_DIR`; uploads are rejected with 507 once reached |
 | `ALLOW_OVERWRITE` | `false`                                     | If `true`, overwrite existing files; else auto-rename like `name (1).ext` |
 | `SAFE_EXTS`       | `.zip,.tar.gz,.tgz,.7z,.rar,.txt,.csv,.pdf` | Comma-separated allowlist. Set empty to allow all                         |
 
@@ -139,6 +184,12 @@ docker run --rm -p 8080:8080 \
 - GET /meta — JSON with max size and destination path.
 
 - GET /healthz — health check.
+
+- GET /files — list uploaded files (name, size).
+  **Header required:** X-Token: <DROPZONE_TOKEN>
+
+- GET /files/{filename} — download a file, streamed.
+  **Header required:** X-Token: <DROPZONE_TOKEN>
 
 - POST /upload — multipart form, one or more files=@... parts.
   **Header required:** X-Token: <DROPZONE_TOKEN>
@@ -192,7 +243,7 @@ PY
 - Optional Virus scanning (ClamAV sidecar or async job)
 - Auth via oauth2-proxy / OIDC
 - `/list` and retention policy (auto-purge after N days)
-- Kubernetes manifests (Kustomize/Argo) with NFS PV to local NAS
+- Kubernetes manifests (Kustomize/Argo)
 
 
 
