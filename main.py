@@ -62,7 +62,7 @@ app = FastAPI(title="Dropzone", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "DELETE"],
     allow_headers=["*"]
 )
 
@@ -100,7 +100,10 @@ INDEX_HTML = """
       </div>
       <div class="drop" id="drop">Drag files here or click to select</div>
       <input type="file" id="fileInput" multiple style="display:none"/>
+      <h3>Uploads</h3>
       <div id="list"></div>
+      <h3>Files on server</h3>
+      <div id="serverFiles"></div>
       <p class="muted">
         Files are streamed to the server and written directly to disk.<br/>
         Limit: <span id="limit"></span>. Destination is server-side configured.
@@ -116,11 +119,13 @@ INDEX_HTML = """
     const list = document.getElementById('list');
     const tokenInput = document.getElementById('token');
     const saveBtn = document.getElementById('saveToken');
+    const serverFiles = document.getElementById('serverFiles');
 
     tokenInput.value = localStorage.getItem('dz_token') || '';
     saveBtn.onclick = () => {
       localStorage.setItem('dz_token', tokenInput.value || '');
       alert('Token saved locally in this browser.');
+      loadServerFiles();
     };
 
     drop.addEventListener('click', ()=> fileInput.click());
@@ -131,6 +136,8 @@ INDEX_HTML = """
       handleFiles(e.dataTransfer.files);
     });
     fileInput.addEventListener('change', e => handleFiles(e.target.files));
+
+    loadServerFiles();
 
     function handleFiles(files) {
       [...files].forEach(uploadOne);
@@ -164,6 +171,7 @@ INDEX_HTML = """
           const resp = JSON.parse(xhr.responseText);
           status.textContent = `Uploaded. SHA256: ${resp.results[0].sha256}`;
           prog.value = 100;
+          loadServerFiles();
         } else {
           status.textContent = `Error ${xhr.status}: ${xhr.responseText}`;
         }
@@ -171,6 +179,58 @@ INDEX_HTML = """
       xhr.onerror = () => status.textContent = 'Network error';
       xhr.send(form);
       status.textContent = 'Uploading…';
+    }
+
+    async function loadServerFiles() {
+      serverFiles.textContent = 'Loading…';
+      const tok = localStorage.getItem('dz_token') || '';
+      const headers = {};
+      if (tok) headers['X-Token'] = tok;
+      const resp = await fetch('/files', { headers });
+      if (!resp.ok) {
+        serverFiles.textContent = `Could not load files (${resp.status}). Save a valid token first.`;
+        return;
+      }
+      const data = await resp.json();
+      if (!data.files.length) {
+        serverFiles.textContent = 'No files uploaded yet.';
+        return;
+      }
+      serverFiles.innerHTML = '';
+      data.files.forEach(file => {
+        const row = document.createElement('div');
+        row.className = 'file';
+        row.innerHTML = `<div class="row" style="justify-content:space-between">
+            <div><code>${file.name}</code> (${file.bytes_human})</div>
+            <div class="row">
+              <a href="/files/${encodeURIComponent(file.name)}" target="_blank" rel="noreferrer">Download</a>
+              <button data-del>Delete</button>
+            </div>
+          </div>
+          <div class="muted" data-status></div>`;
+        const btn = row.querySelector('[data-del]');
+        const status = row.querySelector('[data-status]');
+        btn.onclick = async () => {
+          if (!confirm(`Delete ${file.name}?`)) return;
+          btn.disabled = true;
+          status.textContent = 'Deleting…';
+          const delResp = await fetch(`/files/${encodeURIComponent(file.name)}`, {
+            method: 'DELETE',
+            headers
+          });
+          if (delResp.ok) {
+            status.textContent = 'Deleted.';
+            row.remove();
+            if (!serverFiles.children.length) {
+              serverFiles.textContent = 'No files uploaded yet.';
+            }
+          } else {
+            status.textContent = `Delete failed (${delResp.status})`;
+            btn.disabled = false;
+          }
+        };
+        serverFiles.appendChild(row);
+      });
     }
   </script>
 </body>
@@ -221,6 +281,17 @@ def download_file(filename: str, x_token: Optional[str] = Header(default=None)):
     if not path.is_relative_to(DEST_DIR) or not path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+@app.delete("/files/{filename}")
+def delete_file(filename: str, x_token: Optional[str] = Header(default=None)):
+    if not TOKEN or not hmac.compare_digest(x_token or "", TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    path = (DEST_DIR / sanitize_filename(filename)).resolve()
+    if not path.is_relative_to(DEST_DIR) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    path.unlink()
+    return {"ok": True, "deleted": path.name}
 
 
 @app.post("/upload")
