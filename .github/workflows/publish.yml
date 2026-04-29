@@ -3,7 +3,6 @@ name: Build & Push Dropzone
 on:
   push:
     branches: [ "main" ]
-    tags: [ "v*.*.*" ]  # e.g. v0.1.0
 
 env:
   REGISTRY: ghcr.io
@@ -13,9 +12,8 @@ jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
 
-
     permissions:
-      contents: read
+      contents: write
       packages: write
       attestations: write
       id-token: write
@@ -23,6 +21,33 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compute and create next patch version tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest_tag=$(git tag -l 'v*.*.*' --sort=-v:refname | head -n 1)
+          if [[ -z "$latest_tag" ]]; then
+            latest_tag="v1.0.0"
+          fi
+
+          version="${latest_tag#v}"
+          IFS='.' read -r major minor patch <<< "$version"
+          next_patch=$((patch + 1))
+          new_tag="v${major}.${minor}.${next_patch}"
+
+          echo "latest_tag=$latest_tag"
+          echo "new_tag=$new_tag"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$new_tag"
+          git push origin "$new_tag"
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -33,18 +58,22 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v3
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.new_tag }}
+            type=raw,value=latest
 
       - name: Build and push Docker image
         id: push
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
         with:
