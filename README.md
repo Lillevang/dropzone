@@ -36,6 +36,9 @@ curl -H "X-Token: $DROPZONE_TOKEN" http://localhost:8080/files
 
 # Download a file (with progress)
 curl -H "X-Token: $DROPZONE_TOKEN" http://localhost:8080/files/archive.zip --progress-bar -o archive.zip
+
+# Delete a file
+curl -X DELETE -H "X-Token: $DROPZONE_TOKEN" http://localhost:8080/files/test.txt
 ```
 
 Health:
@@ -191,6 +194,9 @@ docker run --rm -p 8080:8080 \
 - GET /files/{filename} — download a file, streamed.
   **Header required:** X-Token: <DROPZONE_TOKEN>
 
+- DELETE /files/{filename} — delete a file.
+  **Header required:** X-Token: <DROPZONE_TOKEN>
+
 - POST /upload — multipart form, one or more files=@... parts.
   **Header required:** X-Token: <DROPZONE_TOKEN>
 
@@ -244,6 +250,5 @@ PY
 - Auth via oauth2-proxy / OIDC
 - `/list` and retention policy (auto-purge after N days)
 - Kubernetes manifests (Kustomize/Argo)
-
 
 
