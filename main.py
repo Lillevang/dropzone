@@ -2,10 +2,10 @@ import hashlib
 import hmac
 import os
 import secrets
+import time
 
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pathlib import Path
 from starlette.concurrency import run_in_threadpool
 from typing import List, Optional
@@ -23,6 +23,21 @@ MAX_TOTAL_BYTES = int(os.getenv("MAX_TOTAL_BYTES", "0"))
 ALLOW_OVERWRITE = os.getenv("ALLOW_OVERWRITE", "false").lower() == "true"
 SAFE_EXTS = set(
     (os.getenv("SAFE_EXTS", ".zip,.tar.gz,.tgz,.7z,.rar,.txt,.csv,.pdf").split(",")))
+
+# Host allowlist (comma-separated, e.g. "dropzone.lillevang.dev"). Empty = any
+# Host accepted. /healthz is always exempt so kubelet/Docker probes that hit
+# the pod IP or localhost keep working.
+ALLOWED_HOSTS = {
+    h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+# Per-client rate limit (token bucket), mirroring the nginx limit_req settings
+# used by the other *.lillevang.dev apps: 10 r/s sustained, burst 30, 429 when
+# exceeded. RATE_LIMIT_RPS=0 disables. Keyed on the client IP uvicorn reports;
+# behind a proxy set FORWARDED_ALLOW_IPS so X-Forwarded-For is honored,
+# otherwise all visitors share the proxy's bucket.
+RATE_LIMIT_RPS = float(os.getenv("RATE_LIMIT_RPS", "10"))
+RATE_LIMIT_BURST = float(os.getenv("RATE_LIMIT_BURST", "30"))
 
 
 # ========= helpers =========
@@ -58,13 +73,42 @@ def sha256_file(path: Path) -> str:
 
 
 # ========= app =========
-app = FastAPI(title="Dropzone", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST", "GET", "DELETE"],
-    allow_headers=["*"]
-)
+# Auto-docs are disabled: /docs, /redoc and /openapi.json would hand scanners
+# a complete API map of a publicly reachable service.
+app = FastAPI(title="Dropzone", version="0.1.0",
+              docs_url=None, redoc_url=None, openapi_url=None)
+
+# ip -> (tokens, last refill). Single-process state; fine for one uvicorn worker.
+_buckets: dict = {}
+
+
+@app.middleware("http")
+async def gatekeeper(request: Request, call_next):
+    if request.url.path == "/healthz":
+        return await call_next(request)
+
+    if ALLOWED_HOSTS:
+        host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+        if host not in ALLOWED_HOSTS:
+            # Same idea as the nginx default-server 444: unknown vhosts get
+            # nothing useful. ASGI can't drop the connection, so a bare 404.
+            return PlainTextResponse("", status_code=404)
+
+    if RATE_LIMIT_RPS > 0:
+        ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        tokens, last = _buckets.get(ip, (RATE_LIMIT_BURST, now))
+        tokens = min(RATE_LIMIT_BURST, tokens + (now - last) * RATE_LIMIT_RPS)
+        if tokens < 1:
+            _buckets[ip] = (tokens, now)
+            return JSONResponse({"detail": "Too Many Requests"}, status_code=429)
+        _buckets[ip] = (tokens - 1, now)
+        if len(_buckets) > 10_000:
+            cutoff = now - 60
+            for key in [k for k, (_, t) in _buckets.items() if t < cutoff]:
+                del _buckets[key]
+
+    return await call_next(request)
 
 INDEX_HTML = """
 <!doctype html>
@@ -254,7 +298,9 @@ def index():
 
 @app.get("/meta")
 def meta():
-    return {"max_bytes": MAX_BYTES, "max_bytes_human": human_bytes(MAX_BYTES), "dest_dir": str(DEST_DIR)}
+    # Unauthenticated (the UI fetches it before a token is saved), so it must
+    # not expose server internals like the destination path.
+    return {"max_bytes": MAX_BYTES, "max_bytes_human": human_bytes(MAX_BYTES)}
 
 
 @app.get("/healthz")

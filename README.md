@@ -176,6 +176,10 @@ docker run --rm -p 8080:8080 \
 | `MAX_TOTAL_BYTES` | `0` (unlimited)                             | Total bytes allowed in `DEST_DIR`; uploads are rejected with 507 once reached |
 | `ALLOW_OVERWRITE` | `false`                                     | If `true`, overwrite existing files; else auto-rename like `name (1).ext` |
 | `SAFE_EXTS`       | `.zip,.tar.gz,.tgz,.7z,.rar,.txt,.csv,.pdf` | Comma-separated allowlist. Set empty to allow all                         |
+| `ALLOWED_HOSTS`   | *(empty — any)*                             | Comma-separated Host allowlist (e.g. `dropzone.lillevang.dev`). Requests with any other Host get an empty 404; `/healthz` is always exempt |
+| `RATE_LIMIT_RPS`  | `10`                                        | Per-client sustained requests/second; `0` disables rate limiting          |
+| `RATE_LIMIT_BURST`| `30`                                        | Requests a client may burst before 429s kick in                           |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1`                             | Read by uvicorn. Behind a proxy/ingress, set to the proxy's IPs/CIDRs so the real client IP (from `X-Forwarded-For`) is used for rate limiting |
 
 
 ---
@@ -184,7 +188,7 @@ docker run --rm -p 8080:8080 \
 
 - GET / — drag-and-drop UI.
 
-- GET /meta — JSON with max size and destination path.
+- GET /meta — JSON with the per-file size limit.
 
 - GET /healthz — health check.
 
@@ -216,7 +220,13 @@ Response:
 
 ## Security model (public endpoint)
 
-- Endpoint is publicly reachable, but uploads require the shared header token.
+- Endpoint is publicly reachable, but uploads, listing, download and delete all require the shared header token.
+
+- FastAPI's auto-docs (`/docs`, `/redoc`, `/openapi.json`) are disabled so scanners can't enumerate the API.
+
+- Per-client rate limiting (10 r/s, burst 30 by default) answers probe floods with 429. For it to key on the real client IP behind a proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address.
+
+- Set `ALLOWED_HOSTS` in real deployments so requests that arrive by IP or a foreign Host header get an empty 404 instead of the app.
 
 - Use long, random tokens (>= 32 bytes). Rotate after use.
 
