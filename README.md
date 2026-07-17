@@ -1,5 +1,3 @@
-![Build & Push](https://github.com/Lillevang/dropzone/actions/workflows/publish.yml/badge.svg)
-
 # Dropzone
 
 A tiny, single-file FastAPI app that lets you **drag-and-drop files in a browser** and streams them to disk.  
@@ -249,6 +247,45 @@ PY
 - **PermissionError on writes:** fix bind mount perms (see Docker section).
 - **Large files fila:** Increase `MAX_BYTES`, and ensure your proxy allows large bodies (client_max_body_size / ingress annotations).
 - **SELinux denies writes:** add `:Z` to the volume.
+
+---
+
+## Releasing
+
+Releases are cut **locally** with [Task](https://taskfile.dev) — there is no CI
+image push. Every published image is signed with cosign on the way out, because
+the cluster's Kyverno `verify-image-signatures` policy requires every
+`ghcr.io/lillevang/*` image to carry a signature.
+
+The signing key is deliberately GitHub-independent: private key + password live
+only in 1Password, and no CI system holds a secret.
+
+```bash
+task bump          # or: task bump TARGET=minor
+task release       # build → health check → push → sign → commit + tag
+```
+
+`.version` holds bare semver; images are tagged `v<version>` (e.g. `v0.1.2`).
+
+**Prerequisites:** `podman` (or `docker`), `skopeo`, `jq`, `cosign`, `op`, plus:
+
+```bash
+# GHCR login
+gh auth token | podman login ghcr.io -u Lillevang --password-stdin
+
+# a live 1Password session — a stale one makes cosign fail with a
+# misleading "invalid pem block"
+eval $(op signin)
+```
+
+Verify any published image against the public key (committed in the infra repo's
+`apps/kyverno-policies/verify-images.yaml`):
+
+```bash
+cosign verify --key cosign.pub ghcr.io/lillevang/dropzone:<tag>
+```
+
+After releasing, bump the image tag in the infra repo's app manifest to deploy.
 
 ---
 
