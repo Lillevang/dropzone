@@ -97,11 +97,18 @@ tasks:
     internal: true
     cmds:
       - |
+        set -euo pipefail
         # Resolve the digest from the REGISTRY (not the local image store): that
         # is what the cluster pulls and what Kyverno verifies. skopeo shares
         # podman's credential store (containers/auth.json), unlike crane which
-        # reads ~/.docker/config.json.
-        skopeo inspect --no-tags docker://{{.IMAGE}}:{{.TAG}} | jq -r .Digest > .digest
+        # reads ~/.docker/config.json. Validated so a registry blip can't
+        # truncate .digest and send cosign at "{{.IMAGE}}@".
+        DIGEST=$(skopeo inspect --no-tags docker://{{.IMAGE}}:{{.TAG}} | jq -er .Digest)
+        case "$DIGEST" in
+          sha256:*) ;;
+          *) echo "❌ unexpected digest for {{.IMAGE}}:{{.TAG}}: '$DIGEST'"; exit 1;;
+        esac
+        echo "$DIGEST" > .digest
 
   sign:
     desc: Sign the pushed image digest with cosign (key injected from 1Password, never on disk)
@@ -118,12 +125,17 @@ tasks:
         # sha256-<digest>.sig signature its Cosign attestor reads, and keep the
         # release out of the public Rekor log (policy sets rekor.ignoreTlog).
         # Deprecated upstream — revisit at the next Kyverno upgrade.
-        COSIGN_PRIVATE_KEY=$(op read "{{.OP_ITEM}}/private-key") \
-        COSIGN_PASSWORD=$(op read "{{.OP_ITEM}}/password") \
-          cosign sign --yes \
-            --new-bundle-format=false --use-signing-config=false --tlog-upload=false \
-            --key env://COSIGN_PRIVATE_KEY \
-            {{.IMAGE}}@$DIGEST
+        # Assign on their own lines, NOT as a `VAR=$(op read ...) cosign ...`
+        # prefix: errexit ignores a failed substitution in an assignment
+        # prefix, so a dead 1Password session hands cosign an EMPTY key and
+        # fails with a misleading "invalid pem block" (url-shortener PR #13).
+        COSIGN_PRIVATE_KEY=$(op read "{{.OP_ITEM}}/private-key")
+        COSIGN_PASSWORD=$(op read "{{.OP_ITEM}}/password")
+        export COSIGN_PRIVATE_KEY COSIGN_PASSWORD
+        cosign sign --yes \
+          --new-bundle-format=false --use-signing-config=false --tlog-upload=false \
+          --key env://COSIGN_PRIVATE_KEY \
+          {{.IMAGE}}@$DIGEST
 
   verify-signature:
     desc: Verify the pushed image's signature offline, exactly as the cluster does
@@ -132,10 +144,12 @@ tasks:
       - |
         set -euo pipefail
         DIGEST=$(cat .digest)
-        COSIGN_PUBLIC_KEY=$(op read "{{.OP_ITEM}}/public-key") \
-          cosign verify --key env://COSIGN_PUBLIC_KEY \
-            --insecure-ignore-tlog=true \
-            {{.IMAGE}}@$DIGEST > /dev/null
+        # Bare assignment, not a prefix — see the note in `sign`.
+        COSIGN_PUBLIC_KEY=$(op read "{{.OP_ITEM}}/public-key")
+        export COSIGN_PUBLIC_KEY
+        cosign verify --key env://COSIGN_PUBLIC_KEY \
+          --insecure-ignore-tlog=true \
+          {{.IMAGE}}@$DIGEST > /dev/null
         echo "✅ Signature verified for {{.IMAGE}}@$DIGEST"
 
   trivy:
