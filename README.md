@@ -262,12 +262,18 @@ only in 1Password, and no CI system holds a secret.
 
 ```bash
 task bump          # or: task bump TARGET=minor
-task release       # build → health check → push → sign → commit + tag
+task release       # build → health check → push → sign → verify → scan → commit
 ```
 
-`.version` holds bare semver; images are tagged `v<version>` (e.g. `v0.1.2`).
+`.version` holds the version and the image is tagged with it verbatim (e.g.
+`0.1.3`), matching the website/rejs repos. Note this drops the `v` prefix dropzone
+used under the old CI — bump the infra manifest accordingly on the next release.
 
-**Prerequisites:** `podman` (or `docker`), `skopeo`, `jq`, `cosign`, `op`, plus:
+`task verify-signature` checks a published image offline exactly as the cluster
+does; `task trivy` writes an SBOM + vulnerability report to `security/`. Both run
+as part of `release`.
+
+**Prerequisites:** `podman` (or `docker`), `skopeo`, `jq`, `cosign`, `trivy`, `op`, plus:
 
 ```bash
 # GHCR login
@@ -278,14 +284,18 @@ gh auth token | podman login ghcr.io -u Lillevang --password-stdin
 eval $(op signin)
 ```
 
-Verify any published image against the public key (committed in the infra repo's
-`apps/kyverno-policies/verify-images.yaml`):
+To check a published image against the key in 1Password, offline and exactly as
+the cluster does:
 
 ```bash
-cosign verify --key cosign.pub ghcr.io/lillevang/dropzone:<tag>
+task verify-signature
 ```
 
-After releasing, bump the image tag in the infra repo's app manifest to deploy.
+The matching public key is committed in the infra repo's
+`apps/kyverno-policies/verify-images.yaml`.
+
+After releasing, bump the image tag in the infra repo (`apps/dropzone/deploy.yaml`)
+to deploy via ArgoCD.
 
 ---
 

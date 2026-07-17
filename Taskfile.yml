@@ -1,50 +1,53 @@
 # https://taskfile.dev
-#
-# Local release flow for dropzone. This is the ONLY publish path — images are
-# signed here with cosign (key from 1Password, never on disk), because the
-# cluster's Kyverno `verify-image-signatures` policy requires every
-# ghcr.io/lillevang/* image to carry a signature. See infra docs/kyverno.md
-# (Phase 3).
-#
-# Prerequisites:
-#   - podman (or docker), skopeo, jq, cosign, op (1Password CLI)
-#   - a live 1Password session: `eval $(op signin)` — a stale session makes
-#     cosign fail with a misleading "invalid pem block"
-#   - GHCR login: `gh auth token | podman login ghcr.io -u Lillevang --password-stdin`
-#
-# Typical release:  task bump && task release
 
 version: '3'
 
 vars:
   IMAGE: ghcr.io/lillevang/dropzone
-  VERSION_FILE: .version
-  VERSION:
+  TAG_FILE: .version
+  TAG:
     sh: cat .version
-  # Image tags keep the historical `v` prefix (v0.1.0, v0.1.1, ...) while
-  # .version holds bare semver so `bump` can do arithmetic on it.
-  TAG: 'v{{.VERSION}}'
   RUNTIME:
     sh: command -v podman >/dev/null 2>&1 && echo podman || echo docker
+  # Private key + password live only in 1Password — never on disk, never in CI.
+  OP_ITEM: '{{.OP_ITEM | default "op://Personal/cosign"}}'
+
+# cosign and trivy (go-containerregistry) read $DOCKER_CONFIG/config.json, but
+# podman keeps its ghcr.io credentials in its own authfile. Point those tools at
+# podman's authfile so a single `podman login ghcr.io` is all you need; there is
+# no separate `docker login` / ~/.docker/config.json to keep in sync. Falls back
+# to the default docker config when podman is not the runtime.
+env:
+  DOCKER_CONFIG:
+    sh: |
+      if command -v podman >/dev/null 2>&1; then
+        for f in "${REGISTRY_AUTH_FILE:-}" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/containers/auth.json" "$HOME/.config/containers/auth.json"; do
+          if [ -n "$f" ] && [ -f "$f" ]; then
+            d="${TMPDIR:-/tmp}/dropzone-ghcr-authcfg"
+            mkdir -p "$d" && ln -sf "$f" "$d/config.json"
+            echo "$d"; exit 0
+          fi
+        done
+      fi
+      echo "${DOCKER_CONFIG:-$HOME/.docker}"
 
 tasks:
-
   bump:
     desc: Bump version (patch, minor, major)
     vars:
       TARGET: '{{.TARGET | default "patch"}}'
     cmds:
       - |
-        CURRENT=$(cat {{.VERSION_FILE}})
+        CURRENT=$(cat {{.TAG_FILE}})
         IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
         case "{{.TARGET}}" in
-          patch) PATCH=$((PATCH+1));;
-          minor) MINOR=$((MINOR+1)); PATCH=0;;
-          major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0;;
-          *) echo "Unknown bump target: {{.TARGET}}" && exit 1;;
+         patch) PATCH=$((PATCH+1));;
+         minor) MINOR=$((MINOR+1)); PATCH=0;;
+         major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0;;
+         *) echo "Unknown bump target: {{.TARGET}}" && exit 1;;
         esac
         NEW="$MAJOR.$MINOR.$PATCH"
-        echo "$NEW" > {{.VERSION_FILE}}
+        echo "$NEW" > {{.TAG_FILE}}
         echo "🔼 Bumped version: $CURRENT → $NEW"
 
   build:
@@ -53,18 +56,20 @@ tasks:
       - "{{.RUNTIME}} build -t {{.IMAGE}}:{{.TAG}} ."
 
   healthcheck:
-    desc: Run the built image locally and probe /healthz
+    desc: Run local container and check /healthz endpoint
     cmds:
       - |
         echo "🚀 Starting container {{.IMAGE}}:{{.TAG}}"
         NETWORK_OPT=$([ "{{.RUNTIME}}" = "podman" ] && echo "--network=slirp4netns" || echo "")
-        # /healthz is exempt from the Host allowlist and needs no token, but the
-        # app still requires DROPZONE_TOKEN to be set for a realistic boot.
+        # /healthz needs no token and is exempt from the Host allowlist, but the
+        # app still wants DROPZONE_TOKEN set for a realistic boot.
         CID=$({{.RUNTIME}} run -d $NETWORK_OPT -p 8081:8080 \
           -e DROPZONE_TOKEN=healthcheck-only \
           {{.IMAGE}}:{{.TAG}})
-        echo "⌛ Waiting for container to be ready"
-        sleep 3
+        echo "⌛ Waiting for /healthz"
+        sleep 5
+        # Unlike the other apps, dropzone's /healthz returns JSON ({"ok":true}),
+        # not the literal string "ok" — so this checks for a 200, not a body.
         if curl --max-time 5 -fs http://localhost:8081/healthz >/dev/null; then
           echo "✅ Health check passed"
         else
@@ -92,80 +97,74 @@ tasks:
     internal: true
     cmds:
       - |
-        # Resolve the digest from the REGISTRY (not a local image inspect) —
-        # it's the pushed manifest digest the cluster verifies. skopeo shares
-        # podman's credential store, unlike crane which reads ~/.docker/config.json.
+        # Resolve the digest from the REGISTRY (not the local image store): that
+        # is what the cluster pulls and what Kyverno verifies. skopeo shares
+        # podman's credential store (containers/auth.json), unlike crane which
+        # reads ~/.docker/config.json.
         skopeo inspect --no-tags docker://{{.IMAGE}}:{{.TAG}} | jq -r .Digest > .digest
-        echo "🔎 Resolved {{.IMAGE}}:{{.TAG}} → $(cat .digest)"
 
   sign:
-    desc: Sign the pushed digest with cosign (key injected from 1Password, never on disk)
-    vars:
-      OP_ITEM: '{{.OP_ITEM | default "op://personal/cosign"}}'
+    desc: Sign the pushed image digest with cosign (key injected from 1Password, never on disk)
     cmds:
       - task: resolve-digest
       - |
         set -euo pipefail
         DIGEST=$(cat .digest)
         echo "🔏 Signing image {{.IMAGE}}@$DIGEST"
-
-        # cosign only reads docker-style config; podman's login may live in
-        # $XDG_RUNTIME_DIR (tmpfs) or, if REGISTRY_AUTH_FILE is exported, in
-        # ~/.docker/config.json. Find whichever is real and hand cosign a copy
-        # via a throwaway DOCKER_CONFIG so signing uses the same creds as push.
-        AUTH_JSON=""
-        for CANDIDATE in \
-          "${REGISTRY_AUTH_FILE:-}" \
-          "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/containers/auth.json" \
-          "$HOME/.docker/config.json"; do
-          if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then AUTH_JSON="$CANDIDATE"; break; fi
-        done
-        if [ -z "$AUTH_JSON" ]; then
-          echo "❌ No registry auth file found — run:"
-          echo "   gh auth token | {{.RUNTIME}} login ghcr.io -u Lillevang --password-stdin"
-          exit 1
-        fi
-        echo "🔑 Using registry auth from $AUTH_JSON"
-
-        DOCKER_CONFIG=$(mktemp -d)
-        export DOCKER_CONFIG
-        trap 'rm -rf "$DOCKER_CONFIG"' EXIT
-        cp "$AUTH_JSON" "$DOCKER_CONFIG/config.json"
-
-        # The three flags are LOAD-BEARING — do not drop them. cosign v3 defaults
-        # to the sigstore bundle format, which Kyverno 1.18 cannot verify
-        # key-based (its SigstoreBundle type is keyless-only in practice). These
-        # produce the legacy sha256-<digest>.sig signature Kyverno reads, and
-        # --tlog-upload=false keeps releases out of the public Rekor log (the
-        # policy sets rekor.ignoreTlog: true to match). Deprecated upstream —
-        # revisit at the next Kyverno upgrade. See infra docs/kyverno.md Phase 3.
+        # Registry auth comes from the DOCKER_CONFIG env block above.
+        # The three flags are LOAD-BEARING (infra docs/kyverno.md, Phase 3):
+        # cosign v3 defaults to the sigstore bundle format (OCI referrers),
+        # which Kyverno 1.18 cannot verify key-based. These produce the legacy
+        # sha256-<digest>.sig signature its Cosign attestor reads, and keep the
+        # release out of the public Rekor log (policy sets rekor.ignoreTlog).
+        # Deprecated upstream — revisit at the next Kyverno upgrade.
         COSIGN_PRIVATE_KEY=$(op read "{{.OP_ITEM}}/private-key") \
         COSIGN_PASSWORD=$(op read "{{.OP_ITEM}}/password") \
           cosign sign --yes \
             --new-bundle-format=false --use-signing-config=false --tlog-upload=false \
             --key env://COSIGN_PRIVATE_KEY \
-            {{.IMAGE}}@"$DIGEST"
-        echo "✅ Signed {{.IMAGE}}@$DIGEST"
+            {{.IMAGE}}@$DIGEST
+
+  verify-signature:
+    desc: Verify the pushed image's signature offline, exactly as the cluster does
+    cmds:
+      - task: resolve-digest
+      - |
+        set -euo pipefail
+        DIGEST=$(cat .digest)
+        COSIGN_PUBLIC_KEY=$(op read "{{.OP_ITEM}}/public-key") \
+          cosign verify --key env://COSIGN_PUBLIC_KEY \
+            --insecure-ignore-tlog=true \
+            {{.IMAGE}}@$DIGEST > /dev/null
+        echo "✅ Signature verified for {{.IMAGE}}@$DIGEST"
+
+  trivy:
+    desc: Generate SBOM and vulnerability report with Trivy
+    cmds:
+      - mkdir -p ./security
+      - echo "🔍 Generating SBOM with Trivy"
+      - trivy image --format cyclonedx --output ./security/sbom-{{.TAG}}.json {{.IMAGE}}:{{.TAG}}
+      - echo "🛡 Generating vulnerability scan report"
+      - trivy image --format json --scanners vuln --output ./security/vulns-{{.TAG}}.json {{.IMAGE}}:{{.TAG}}
 
   commit-artifacts:
-    desc: Commit .version + .digest and tag the release
+    desc: Commit .version, digest, SBOM and vuln reports to Git
     cmds:
       - |
-        echo "📦 Committing release artifacts"
-        git add {{.VERSION_FILE}} .digest
-        git commit -m "🚀 Release {{.TAG}}"
-        git tag {{.TAG}}
+        echo "📦 Committing version + security artifacts"
+        git add .version .digest security/sbom-{{.TAG}}.json security/vulns-{{.TAG}}.json
+        git commit -m "chore: release {{.TAG}}"
         git push
-        git push origin {{.TAG}}
 
   release:
-    desc: Full release pipeline (build, health check, push, sign, commit)
+    desc: Full release pipeline (build, push, sign, verify, scan, commit)
     cmds:
       - task: verify
       - task: push
       - task: sign
+      - task: verify-signature
+      - task: trivy
       - task: commit-artifacts
       - echo ""
       - echo "✅ Released and signed {{.IMAGE}}:{{.TAG}}"
-      - 'echo "   Digest: $(cat .digest)"'
-      - echo "   Bump the image tag in infra's app manifest to deploy."
+      - echo "   Bump the image tag in the infra repo (apps/dropzone/deploy.yaml) to deploy via ArgoCD."
