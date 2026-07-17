@@ -1,5 +1,3 @@
-![Build & Push](https://github.com/Lillevang/dropzone/actions/workflows/publish.yml/badge.svg)
-
 # Dropzone
 
 A tiny, single-file FastAPI app that lets you **drag-and-drop files in a browser** and streams them to disk.  
@@ -249,6 +247,55 @@ PY
 - **PermissionError on writes:** fix bind mount perms (see Docker section).
 - **Large files fila:** Increase `MAX_BYTES`, and ensure your proxy allows large bodies (client_max_body_size / ingress annotations).
 - **SELinux denies writes:** add `:Z` to the volume.
+
+---
+
+## Releasing
+
+Releases are cut **locally** with [Task](https://taskfile.dev) — there is no CI
+image push. Every published image is signed with cosign on the way out, because
+the cluster's Kyverno `verify-image-signatures` policy requires every
+`ghcr.io/lillevang/*` image to carry a signature.
+
+The signing key is deliberately GitHub-independent: private key + password live
+only in 1Password, and no CI system holds a secret.
+
+```bash
+task bump          # or: task bump TARGET=minor
+task release       # build → health check → push → sign → verify → scan → commit
+```
+
+`.version` holds the version and the image is tagged with it verbatim (e.g.
+`0.1.3`), matching the website/rejs repos. Note this drops the `v` prefix dropzone
+used under the old CI — bump the infra manifest accordingly on the next release.
+
+`task verify-signature` checks a published image offline exactly as the cluster
+does; `task trivy` writes an SBOM + vulnerability report to `security/`. Both run
+as part of `release`.
+
+**Prerequisites:** `podman` (or `docker`), `skopeo`, `jq`, `cosign`, `trivy`, `op`, plus:
+
+```bash
+# GHCR login
+gh auth token | podman login ghcr.io -u Lillevang --password-stdin
+
+# a live 1Password session — a stale one makes cosign fail with a
+# misleading "invalid pem block"
+eval $(op signin)
+```
+
+To check a published image against the key in 1Password, offline and exactly as
+the cluster does:
+
+```bash
+task verify-signature
+```
+
+The matching public key is committed in the infra repo's
+`apps/kyverno-policies/verify-images.yaml`.
+
+After releasing, bump the image tag in the infra repo (`apps/dropzone/deploy.yaml`)
+to deploy via ArgoCD.
 
 ---
 
