@@ -1,0 +1,158 @@
+# https://taskfile.dev
+#
+# Dependency updates for an app repo, driven by self-hosted Renovate. Included
+# from the repo's Taskfile.yml as the `deps:` namespace; identical copy in every
+# app repo, canonical copy in infra/apps/renovate/. The Renovate RULES live in
+# the repo's renovate.json, which extends the shared preset in the infra repo
+# (apps/renovate/preset-app.json) - change behaviour there, not here.
+#
+#   task deps:check                what is outdated (dry run, touches nothing)
+#   task deps:pr                   make Renovate open/refresh this repo's PRs on GitHub now
+#   task deps:fix                  merge every open Renovate PR into the current branch,
+#                                  regenerate the lockfile, reinstall - then task verify/bump/release
+#   task deps:fix LABEL=security   only the CVE PRs
+#   task deps:fix NO_PR=1          skip the Renovate run, merge what is already open
+#
+# Renovate cannot write to a local checkout (its `local` platform is dry-run
+# only), so "fix" means merging the branches Renovate pushed. Pushing main
+# afterwards makes GitHub mark those PRs merged and Renovate prunes the
+# branches. Needs: gh (logged in), jq, podman or docker. Both check and pr fetch
+# the preset from infra's main, so a preset change must be pushed first.
+
+version: '3'
+
+set: [errexit, nounset, pipefail]
+
+vars:
+  RENOVATE_IMAGE: ghcr.io/renovatebot/renovate:latest
+  CHECK_LOG: .renovate-check.jsonl
+  REPO:
+    sh: gh repo view --json nameWithOwner -q .nameWithOwner
+  RUNTIME:
+    sh: command -v podman >/dev/null 2>&1 && echo podman || echo docker
+  # Must equal gitAuthor in infra apps/renovate/global.json. Renovate refuses to
+  # rebase a branch whose last commit is by an unknown author, so every runner
+  # (cluster CronJob, infra `just deps-pr`, this file) must commit as the same one.
+  GIT_AUTHOR: 'Renovate (local) <jeppe.lillevang@gmail.com>'
+  LABEL: '{{.LABEL | default "dependencies"}}'
+  NO_PR: '{{.NO_PR | default ""}}'
+
+tasks:
+
+  check:
+    silent: true
+    desc: Dry run - table of outdated dependencies for this repo (touches nothing)
+    cmds:
+      - |
+        {{.RUNTIME}} run --rm \
+          -v "$PWD:/usr/src/app:Z" -w /usr/src/app \
+          -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+          -e LOG_LEVEL=debug -e LOG_FORMAT=json \
+          -e RENOVATE_PLATFORM=local \
+          -e RENOVATE_CONFIG_FILE=/usr/src/app/renovate.json \
+          -e GITHUB_COM_TOKEN="$(gh auth token)" \
+          {{.RENOVATE_IMAGE}} > {{.CHECK_LOG}} 2>&1 || {
+            echo "❌ Renovate failed (full log: {{.CHECK_LOG}})"
+            jq -R 'fromjson?' {{.CHECK_LOG}} | jq -r 'select(.level>=50)
+              | "   \(.msg): \(.validationError // .err.validationError // .err.message // "")"' | sort -u
+            exit 1
+          }
+        # The image prints the odd non-JSON line (node warnings); -R/fromjson? skips them.
+        jq -R 'fromjson?' {{.CHECK_LOG}} | jq -r '
+          select(.msg=="packageFiles with updates") | .config | to_entries[] | .key as $m
+          | .value[] | .packageFile as $f | .deps[] | select((.updates|length)>0)
+          | "\($m)\t\($f)\t\(.depName)\t\(.currentValue // (.currentDigest|.[0:19]))\t\([.updates[] | "\(.updateType): \(.newValue // (.newDigest|.[0:19]))"]|join(", "))"' \
+          | sort -u | column -t -s $'\t'
+        echo
+        # Errors + warnings, minus the local platform's known noise about owner presets.
+        jq -R 'fromjson?' {{.CHECK_LOG}} | jq -r '
+          select(.level>=40) | select(.msg|test("default owner preset")|not)
+          | "\(if .level>=50 then "ERROR" else "WARN" end): \(.msg)\(if .err.message then " - " + .err.message else "" end)"' | sort -u
+
+  pr:
+    silent: true
+    desc: Run Renovate against GitHub for this repo - opens/refreshes its PRs and the Dependency Dashboard
+    cmds:
+      - |
+        echo "🤖 Renovate → {{.REPO}} (reads the COMMITTED renovate.json on the default branch)"
+        {{.RUNTIME}} run --rm \
+          -e LOG_LEVEL=info \
+          -e RENOVATE_PLATFORM=github \
+          -e RENOVATE_TOKEN="$(gh auth token)" \
+          -e RENOVATE_REPOSITORIES='{{.REPO}}' \
+          -e RENOVATE_ONBOARDING=false \
+          -e RENOVATE_GIT_AUTHOR='{{.GIT_AUTHOR}}' \
+          {{.RENOVATE_IMAGE}}
+
+  preflight:
+    silent: true
+    internal: true
+    cmds:
+      - |
+        # Merges land on whatever is checked out; a dirty tree would get tangled in them.
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+          echo "❌ working tree is not clean - commit or stash first"; exit 1
+        fi
+        gh auth status >/dev/null 2>&1 || { echo "❌ gh is not logged in - run: gh auth login"; exit 1; }
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        [ "$BRANCH" = "main" ] || echo "ℹ️  on '$BRANCH', not main - PRs only auto-close once these commits reach main"
+
+  fix:
+    silent: true
+    desc: Merge every open Renovate PR (LABEL=security for CVE fixes only) into the current branch, regenerate the lockfile, reinstall
+    cmds:
+      - task: preflight
+      - '{{if eq .NO_PR "1"}}echo "↷ NO_PR=1 - merging the PRs already open"{{else}}task deps:pr{{end}}'
+      - |
+        LOCKFILES="package-lock.json uv.lock go.sum"
+        mapfile -t PRS < <(gh pr list -R '{{.REPO}}' --state open --label '{{.LABEL}}' \
+          --json headRefName,number,title \
+          --jq '.[] | select(.headRefName|startswith("renovate/")) | "\(.headRefName)\t#\(.number) \(.title)"')
+        if [ ${#PRS[@]} -eq 0 ]; then
+          echo "✅ no open Renovate PRs labelled '{{.LABEL}}' on {{.REPO}}"; exit 0
+        fi
+        git fetch --quiet --prune origin '+refs/heads/renovate/*:refs/remotes/origin/renovate/*'
+        merged=(); skipped=()
+        for line in "${PRS[@]}"; do
+          br="${line%%$'\t'*}"; title="${line#*$'\t'}"
+          echo "🔀 $title"
+          if git merge --quiet --no-edit "origin/$br" >/dev/null 2>&1; then
+            merged+=("$title"); continue
+          fi
+          conflicts=$(git diff --name-only --diff-filter=U)
+          # Sibling PRs always collide on the lockfile. That is fine: take either
+          # side and regenerate it from the merged manifests below. Anything else
+          # conflicting is a real decision - leave that PR out and say so.
+          others=$(printf '%s\n' "$conflicts" | grep -vxF -e package-lock.json -e uv.lock -e go.sum || true)
+          if [ -n "$conflicts" ] && [ -z "$others" ]; then
+            printf '%s\n' "$conflicts" | xargs git checkout --theirs --
+            printf '%s\n' "$conflicts" | xargs git add --
+            git commit --quiet --no-edit
+            merged+=("$title")
+          else
+            git merge --abort
+            echo "   ⚠️  conflicts outside the lockfile - skipped:"; printf '      %s\n' $conflicts
+            skipped+=("$title")
+          fi
+        done
+        if [ ${#merged[@]} -gt 0 ]; then
+          # Regenerate the lockfile from the merged manifests and refresh the
+          # local install, so what you verify is what the PRs asked for.
+          if   [ -f package-lock.json ]; then echo "🔒 npm install --package-lock-only && npm ci"; npm install --package-lock-only --no-audit --no-fund >/dev/null; npm ci --no-audit --no-fund >/dev/null
+          elif [ -f uv.lock ];           then echo "🔒 uv lock && uv sync"; uv lock --quiet; uv sync --quiet
+          elif [ -f go.sum ];            then echo "🔒 go mod tidy"; go mod tidy
+          fi
+          for f in $LOCKFILES; do [ -f "$f" ] && git add -- "$f" || true; done
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "chore(deps): regenerate lockfile after merging Renovate PRs"
+          fi
+        fi
+        echo
+        echo "✅ merged ${#merged[@]} PR(s)"; printf '   %s\n' "${merged[@]}"
+        if [ ${#skipped[@]} -gt 0 ]; then
+          echo "⚠️  skipped ${#skipped[@]} - conflicts with what was just merged:"; printf '   %s\n' "${skipped[@]}"
+          echo "   Push, then run 'task deps:fix' again: Renovate rebases conflicted PRs on its next run."
+        fi
+        echo
+        echo "Next: task verify   →   task bump   →   task release   →   git push (marks the PRs merged)"
+        echo "      then bump the image tag in infra (its Renovate opens that PR on the next run)."

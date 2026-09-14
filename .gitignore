@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 *.pyc
 uploads/
+
+# Renovate dry-run log (task deps:check)
+.renovate-check.jsonl

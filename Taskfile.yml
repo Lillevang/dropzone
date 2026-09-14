@@ -2,6 +2,10 @@
 
 version: '3'
 
+# Dependency updates (task deps:check / deps:pr / deps:fix) - see Taskfile.deps.yml.
+includes:
+  deps: ./Taskfile.deps.yml
+
 vars:
   IMAGE: ghcr.io/lillevang/dropzone
   TAG_FILE: .version

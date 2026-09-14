@@ -1,0 +1,7 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "requirements.txt is unpinned (fastapi, uvicorn, python-multipart), so Renovate has nothing to bump there; only the python base image is tracked until the deps are pinned.",
+  "extends": [
+    "github>Lillevang/infra//apps/renovate/preset-app"
+  ]
+}
